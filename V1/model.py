@@ -5,96 +5,82 @@ from torch import nn
 
 # %%
 
+class Conv_Block(nn.Module):
+    def __init__(self, in_channel, output_channel, ksize, stride, padding, upsample=False):
+        super(Conv_Block, self).__init__()
+
+        if upsample :
+            layers = [nn.ConvTranspose2d(in_channel, output_channel, ksize, stride, padding)]
+        else :
+            layers = [nn.Conv2d(in_channel, output_channel, ksize, stride, padding)]
+        
+        layers.append(nn.InstanceNorm2d(output_channel, affine=True, track_running_stats=True))
+        layers.append(nn.ReLU(True))
+        
+        self.Block = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.Block(x)
+
 class Residual_block(nn.Module):
-    def __init__(self, in_channel, output_channel, strides=1, use_branch=True):
+    def __init__(self, in_channel, output_channel):
         super(Residual_block, self).__init__()
 
-        self.branch1 = lambda x: x
-        if use_branch:
-            self.branch1 = nn.Conv2d(in_channel, output_channel, 1, strides)
-        
-        self.branch2 = nn.Sequential(
-            nn.Conv2d(in_channel, output_channel//4, 1, strides),
-            nn.InstanceNorm2d(output_channel//4, affine=True, track_running_stats=True),
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channel, output_channel, 1, 1),
+            nn.InstanceNorm2d(output_channel, affine=True, track_running_stats=True),
             nn.ReLU(True),
-            nn.Conv2d(output_channel//4, output_channel//4, 3, 1, padding=1),
-            nn.InstanceNorm2d(output_channel//4, affine=True, track_running_stats=True),
-            nn.ReLU(True),
-            nn.Conv2d(output_channel//4, output_channel, 1, 1),
-            nn.InstanceNorm2d(output_channel, affine=True, track_running_stats=True),        
+            nn.Conv2d(output_channel, output_channel, 3, 1, 1),
+            nn.InstanceNorm2d(output_channel, affine=True, track_running_stats=True)       
         )
 
-        self.relu = nn.ReLU(True)
-
     def forward(self, x):
-        out = self.branch2(x)
-        out = self.relu(out + self.branch1(x))
-
+        out = x + self.branch1(block)
         return out
 
 class Generator(nn.Module):
-    def __init__(self, in_channel, n_domains):
+    def __init__(self, in_channel=3, n_domains=3, repeat_num=6):
         super(Generator, self).__init__()
-
         layers = [
-            nn.Conv2d(in_channel, 32, 1, 1),
-            nn.ReLU(True)
+            Conv_Block(in_channel, 64, 7, 1, 3),
+            Conv_Block(64, 128, 4, 2, 1),
+            Conv_Block(128, 256, 4, 2, 1)
         ]
+
+        for _ in range(repeat_num):
+            layers.append(Residual_block(256, 256))
+                        
+        layers.append(Conv_Block(256, 128, 4, 2, 1, True))
+        layers.append(Conv_Block(128, 64, 4, 2, 1, True))
         
-        features = 32
-
-        for _ in range(4):
-            layers.append(Residual_block(features, features*2))
-            layers.append(nn.AvgPool2d(2, 2))
-            features *= 2
-
-        layers.append(Residual_block(features, features))
-        layers.append(Residual_block(features, features))
-        layers.append(Residual_block(features, features)) # To-do : Instance --> Adaptive Instance
-        layers.append(Residual_block(features, features))
-
-        for i in range(4):
-            layers.append(Residual_block(features, features//2))
-            layers.append(nn.Upsample(scale_factor=(2, 2), mode='nearest'))
-            features //= 2
-            
-        layers.append(nn.Conv2d(feature, in_channel, 1, 1))
-
+        layers.append(nn.Conv2d(64, in_channel, 7, 1, 3))
+        layers.append(nn.Tanh())
+        
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         out = self.net(x)
         return out
-    
-class Mapping_Network(nn.Module):
-    def __init__(self, in_channel, n_domains):
-        super(Mapping_Network, self).__init__()
 
-        layers = [
-            nn.Linear(in_channel, 512), 
-            nn.ReLU(True)]
+class Discriminator(nn.Module):
+    def __init__(self, img_size=256, in_channel=3, n_domains=3, repeat_num=6):
+        super(Discriminator, self).__init__()
 
-        for _ in range(1, 6):
-            layers.append(nn.Linear(in_channel, 512))
-            layers.append(nn.ReLU(True))
-        layers.append(nn.Linear(512, 64*n_domains))
+        layers = []
 
-        self.net = nn.Sequential(*layers)
-    
+        curr_f, next_f = in_channel, 64
+        for _ in range(repeat_num):
+            layers.append(nn.Conv2d(curr_f, next_f, 4, 2, 1))
+            layers.append(nn.LeakyReLU(0.01, True))
+            curr_f, next_f = next_f, next_f*2
+        
+        k_size = int(img_size / (2**repeat_num))
+        self.Stem = nn.Sequential(*layers)
+        self.Src = nn.Conv2d(2048, 1, 3, 1, 1)
+        self.Cls = nn.Conv2d(2048, n_domains, k_size)
+
     def forward(self, x):
-        out = self.net(x)
-        return out
-
-class Style_Encoder(nn.Module):
-    def __init__(self, in_channel, n_domains, features):
-        super(Style_Encoder, self).__init__()
-
-        layers = [
-            nn.Conv2d(in_channel, features, 1, 1),
-            nn.ReLU(True)
-        ]
-
-        for _ in range(6):
-            layers.append(Residual_block(features, features*2))
-            layers.append(nn.AvgPool2d(2, 2))
-            features *= 2
+        out = self.Stem(x)
+        out_src = self.Src(out)
+        out_cls = self.Cls(out)
+        return out_src, out_cls.reshape(out_cls.shape[0], out_cls.shape[1])
